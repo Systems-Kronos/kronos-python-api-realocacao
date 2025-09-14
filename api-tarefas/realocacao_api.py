@@ -12,13 +12,7 @@ app = Flask(__name__)
 
 def get_db_connection():
     try:
-        connection = psycopg2.connect(
-            host=os.getenv('SQL_HOST'),
-            user=os.getenv('SQL_USER'),
-            password=os.getenv('SQL_PASSWORD'),
-            dbname=os.getenv('SQL_DBNAME'),
-            port=os.getenv('SQL_PORT', 5432)q
-        )
+        connection = psycopg2.connect(os.getenv('DATABASE_URL'))
         return connection
     except Exception as e:
         print(f"Erro ao conectar ao banco de dados: {e}")
