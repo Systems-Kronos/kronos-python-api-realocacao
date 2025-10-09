@@ -9,6 +9,7 @@ from datetime import datetime
 load_dotenv("kronos-rpa/.env") 
 
 app = Flask(__name__)
+hoje = datetime.now().date()
 
 def get_db_connection():
     try:
@@ -39,7 +40,7 @@ def processar_realocacao(usuario_ausente_id):
                 sub.nCdUsuarioSubstituto,
                 tu.nCdUsuarioOriginal
             FROM fn_busca_substituto(%s) sub
-            JOIN TarefaUsuario tu ON sub.nCdTarefa = tu.nCdTarefa 
+                 JOIN TarefaUsuario tu ON sub.nCdTarefa = tu.nCdTarefa 
             WHERE tu.nCdUsuarioAtuante = %s
         """, (usuario_ausente_id, usuario_ausente_id))
         
@@ -60,6 +61,7 @@ def processar_realocacao(usuario_ausente_id):
                 tarefas_realocadas.append({
                     "nCdTarefa": tarefa_id,
                     "nCdUsuarioOriginal": usuario_original_id,
+                    "nCdUsuarioAtuante": usuario_ausente_id,
                     "nCdUsuarioSubstituto": substituto_id,
                     "cRealocacao": True,
                     "dDataExecucao": datetime.now().isoformat()
@@ -67,6 +69,7 @@ def processar_realocacao(usuario_ausente_id):
             else:
                 tarefas_realocadas.append({
                     "nCdTarefa": tarefa_id,
+                    "nCdUsuarioAtuante": usuario_ausente_id,
                     "cMotivo": "Nenhum substituto qualificado encontrado.",
                     "cRealocacao": False,
                     "dDataExecucao": datetime.now().isoformat()
@@ -84,6 +87,61 @@ def processar_realocacao(usuario_ausente_id):
         if conn:
             conn.close()
 
+def processar_devolucao(usuario_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False, {"erro": "Falha na conexão com o DB SQL."}
+        
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("""
+            SELECT nCdTarefa
+                 , nCdUsuarioOriginal
+                 , nCdUsuarioAtuante
+              FROM TarefaUsuario
+             WHERE nCdUsuarioOriginal = %s
+        """, (usuario_id,))
+        
+        tarefas_a_devolver = cursor.fetchall()
+        
+        if not tarefas_a_devolver:
+            return True, []
+        
+        cursor.execute("""
+            UPDATE TarefaUsuario
+               SET nCdUsuarioAtuante = nCdUsuarioOriginal
+             WHERE nCdUsuarioOriginal = %s
+        """, (usuario_id,))
+
+        tarefas_realocadas = []
+        for tarefa in tarefas_a_devolver:
+            tarefa_id = int(tarefa['nCdTarefa'])
+            usuario_atuante_id = int(tarefa['nddusuarioatuante'])
+            usuario_original_id = int(tarefa['ncdusuariooriginal'])                    
+
+            tarefas_realocadas.append({
+                "nCdTarefa": tarefa_id,
+                "nCdUsuarioAtuante": usuario_atuante_id,
+                "nCdUsuarioOriginal": usuario_original_id,
+                "nCdUsuarioRetornando": usuario_id,
+                "cRealocacao": True,
+                "dDataExecucao": datetime.now().isoformat()
+            })
+        
+        conn.commit() 
+        return True, tarefas_realocadas
+
+    except Exception as e:
+        if conn:
+            conn.rollback() 
+        print(f"Erro inesperado durante a realocação SQL: {e}")
+        return False, {"erro_sql": str(e)}
+    finally:
+        if conn:
+            conn.close()
+
+            
 # --- Endpoints da API ---
 
 @app.route('/realocar-tarefas', methods=['POST'])
@@ -125,11 +183,9 @@ def realocar_tarefas():
         print(f"Erro inesperado no endpoint /realocar-tarefas: {e}")
         return jsonify({"erro": "Ocorreu um erro interno no servidor."}), 500
 
-
 @app.route('/processar-ausencias-agendadas', methods=['POST'])
 def processar_ausencias_agendadas():
     try:
-        hoje = datetime.now().date()
         print(f"Agendado: Iniciando varredura de faltas para a data: {hoje}")
 
         mongo_client = MongoClient(os.getenv('MONGODB_URI'))
@@ -173,6 +229,70 @@ def processar_ausencias_agendadas():
         print(f"Erro no processamento agendado: {e}")
         return jsonify({"erro": f"Erro no processamento agendado: {e}"}), 500
 
+@app.route('/devolucao-tarefas', methods=['POST'])
+def devolucao_tarefa():
+    try:
+        print(f"Agendado: Iniciando varredura de presenças para a data: {hoje}")
+
+        mongo_client = MongoClient(os.getenv('MONGODB_URI'))
+        mongo_db = mongo_client.get_database('dbKronos')
+        calendario_collection = mongo_db.get_collection('calendario')
+        relatorios_collection = mongo_db.get_collection('relatorios_realocacao')
+
+        # Busca no MongoDB por pessoas presentes que não registraram falta hoje, mas possuem uma falta no dia anterior.
+        recem_presentes = calendario_collection.aggregate([
+            { "$match": {
+                "bPresenca": False,
+                "$expr": {
+                    "$and": [
+                        { "$eq": [{ "$dayOfMonth": "$dEvento"}, hoje.day - 1]},
+                        { "$eq": [{ "$month": "$dEvento"}, hoje.month]},
+                        { "$eq": [{ "$year": "$dEvento"}, hoje.year]},
+                    ]
+                }
+            }},
+            {"$lookup": {
+                "from": "calendario",
+                "let": {"user": "$nCdUsuario"},
+                "pipeline": [
+                    {"$match": {
+                        "$expr": {
+                            "$and": [
+                                {"$eq": ["$nCdUsuario", "$$user"]},
+                                {"$eq": [{"$dayOfMonth": "$dEvento"}, hoje.day]},
+                                {"$eq": [{"$month": "$dEvento"}, hoje.month]},
+                                {"$eq": [{"$year": "$dEvento"}, hoje.year]},
+                                {"$eq": ["$bPresenca", False]}
+                            ]
+                        }
+                    }}
+                ],
+                "as": "faltasHoje"
+            }},
+            {"$match": {
+                "faltasHoje": {"$size": 0}
+            }},
+            {"$project": {
+                "_id": 0,
+                "nCdUsuario": 1
+            }}
+        ])
+
+        usuarios_recem_presentes = [int(doc['nCdUsuario']) for doc in recem_presentes if 'nCdUsuario' in doc]
+        usuarios_a_processar = list(set(usuarios_recem_presentes)) 
+
+        relatorio_geral = []
+        for user_id in usuarios_a_processar:
+            print(f"  > Processando devolução para o usuário {user_id}")
+            sucesso, realocacoes = processar_devolucao(user_id)
+            
+            if sucesso and realocacoes:
+                relatorios_collection.insert_many(realocacoes)
+                relatorio_geral.extend(realocacoes)
+
+    except Exception as e:
+        print(f"Erro no processamento de devolução: {e}")
+        return jsonify({"erro": f"Erro no processamento de devolução: {e}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
