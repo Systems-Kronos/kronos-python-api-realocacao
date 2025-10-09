@@ -1,0 +1,19 @@
+name: Processamento Diário de Ausências 
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  call_api_endpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Executar Realocação Agendada (Render API)
+        run: |
+          echo "Chamando a API do Render para processar ausências agendadas..."
+          curl -X POST \
+          -H "Content-Type: application/json" \
+          ${{ secrets.RENDER_API_URL }}
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
