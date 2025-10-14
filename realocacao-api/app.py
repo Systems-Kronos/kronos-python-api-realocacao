@@ -10,9 +10,11 @@ import json
 
 load_dotenv("kronos-rpa/.env") 
 
+# --- Configurações iniciais ---
 app = Flask(__name__)
 hoje = datetime.now().date()
 
+# --- Métodos ---
 def get_db_connection():
     try:
         connection = psycopg2.connect(
@@ -36,6 +38,7 @@ def processar_realocacao(usuario_ausente_id):
         
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) 
 
+        # Busca tarefas ativas do usuário ausente e seus substitutos qualificados
         cursor.execute("""
             SELECT
                 sub.nCdTarefa,
@@ -76,7 +79,8 @@ def processar_realocacao(usuario_ausente_id):
                     "cRealocacao": False,
                     "dDataExecucao": datetime.now().isoformat()
                 })
-        
+
+        # Registra notificações para os usuários, tanto substitutos quanto o usuário ausente
         for realocacao in tarefas_realocadas:
             if realocacao.get("cRealocacao"):
                 mensagem = f"Tarefa {realocacao['nCdTarefa']} realocada para você temporariamente."
@@ -105,6 +109,8 @@ def processar_devolucao(usuario_id):
             return False, {"erro": "Falha na conexão com o DB SQL."}
         
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        # Busca todas as tarefas originais de um usuário, que foram realocadas para outros usuários
         cursor.execute("""
             SELECT nCdTarefa
                  , nCdUsuarioOriginal
@@ -176,6 +182,8 @@ def registra_notificacao(usuario_id, mensagem):
             "cMensagem": json.dumps(mensagem),
             "dCriacao": json.dumps(agora)   # vira "Gestor aceitou sua falta!"
         })
+
+        r.expire(notificacao_key, 7 * 24 * 3600)  # Expira em 7 dias
 
         print(f"Notificação registrada para o usuário {usuario_id}: {mensagem}")
     except Exception as e:
