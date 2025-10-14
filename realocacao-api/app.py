@@ -5,12 +5,16 @@ from pymongo import MongoClient
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
+from redis import Redis
+import json
 
 load_dotenv("kronos-rpa/.env") 
 
+# --- Configurações iniciais ---
 app = Flask(__name__)
 hoje = datetime.now().date()
 
+# --- Métodos ---
 def get_db_connection():
     try:
         connection = psycopg2.connect(
@@ -34,6 +38,7 @@ def processar_realocacao(usuario_ausente_id):
         
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor) 
 
+        # Busca tarefas ativas do usuário ausente e seus substitutos qualificados
         cursor.execute("""
             SELECT
                 sub.nCdTarefa,
@@ -74,7 +79,16 @@ def processar_realocacao(usuario_ausente_id):
                     "cRealocacao": False,
                     "dDataExecucao": datetime.now().isoformat()
                 })
-        
+
+        # Registra notificações para os usuários, tanto substitutos quanto o usuário ausente
+        for realocacao in tarefas_realocadas:
+            if realocacao.get("cRealocacao"):
+                mensagem = f"Tarefa {realocacao['nCdTarefa']} realocada para você temporariamente."
+                registra_notificacao(realocacao['nCdUsuarioSubstituto'], mensagem)
+            else:
+                mensagem = f"Tarefa {realocacao['nCdTarefa']} não pôde ser realocada: {realocacao.get('cMotivo', 'Motivo desconhecido')}."
+                registra_notificacao(usuario_ausente_id, mensagem)
+
         conn.commit() 
         return True, tarefas_realocadas
 
@@ -95,6 +109,8 @@ def processar_devolucao(usuario_id):
             return False, {"erro": "Falha na conexão com o DB SQL."}
         
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        # Busca todas as tarefas originais de um usuário, que foram realocadas para outros usuários
         cursor.execute("""
             SELECT nCdTarefa
                  , nCdUsuarioOriginal
@@ -129,6 +145,10 @@ def processar_devolucao(usuario_id):
                 "dDataExecucao": datetime.now().isoformat()
             })
         
+        for realocacao in tarefas_realocadas:
+            mensagem = f"Tarefa {realocacao['nCdTarefa']} foi devolvida para você!."
+            registra_notificacao(realocacao['nCdUsuarioRetornando'], mensagem)
+
         conn.commit() 
         return True, tarefas_realocadas
 
@@ -141,14 +161,38 @@ def processar_devolucao(usuario_id):
         if conn:
             conn.close()
 
-            
+def registra_notificacao(usuario_id, mensagem):
+    try:
+        r = Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT')),
+            db=int(os.getenv('REDIS_DB', 0)),
+            username=os.getenv('REDIS_USER'),
+            password=os.getenv('REDIS_PASSWORD')
+        )
+        notificacao_id = r.incr(f"usuario:{usuario_id}:notificacao:id")
+        notificacao_key = f"usuario:{usuario_id}:notificacao:{notificacao_id}"
+
+        # Atributos da notificação
+        agora = datetime.now().isoformat()
+        
+        # Insere a notificação como um hash
+        r.hset(notificacao_key, mapping={
+            "nCdUsuario": usuario_id,
+            "cMensagem": json.dumps(mensagem),
+            "dCriacao": json.dumps(agora)   # vira "Gestor aceitou sua falta!"
+        })
+
+        r.expire(notificacao_key, 7 * 24 * 3600)  # Expira em 7 dias
+
+        print(f"Notificação registrada para o usuário {usuario_id}: {mensagem}")
+    except Exception as e:
+        print(f"Erro ao registrar notificação no Redis: {e}")
+      
 # --- Endpoints da API ---
 
 @app.route('/realocar-tarefas', methods=['POST'])
 def realocar_tarefas():
-    """
-    ENDPOINT 1: Recebe o webhook da Trigger do MongoDB (Realocação em Tempo Real).
-    """
     try:
         data = request.get_json()
         usuario_ausente_id = data.get('nCdUsuario')
@@ -219,12 +263,13 @@ def processar_ausencias_agendadas():
                 relatorio_geral.extend(realocacoes)
         
         print(f"Agendado: Processamento de {len(usuarios_a_processar)} usuários concluído.")
+        
+        
         return jsonify({
             "mensagem": "Processamento agendado concluído com sucesso.",
             "usuarios_processados": len(usuarios_a_processar),
             "total_tarefas_realocadas": len(relatorio_geral)
         }), 200
-
     except Exception as e:
         print(f"Erro no processamento agendado: {e}")
         return jsonify({"erro": f"Erro no processamento agendado: {e}"}), 500
