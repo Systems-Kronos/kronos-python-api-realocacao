@@ -96,8 +96,8 @@ A aplicação é configurada para deploy como um serviço web no **Render**, uti
 
 O projeto inclui um fluxo de trabalho (Workflow) do GitHub Actions para garantir o processamento diário das ausências agendadas.
 
-* **Frequência:** Diariamente às **03:00 UTC** (`cron: '0 3 * * *'`)
-* **Ação:** Chama o endpoint `/processar-ausencias-agendadas` da API do Render (utilizando a variável de segredo `RENDER_API_URL`).
+* **Frequência:** Diariamente às **06:00 UTC** (`cron: '0 6 * * *'`)
+* **Ação:** Chama os endpoints `/processar-ausencias-agendadas` e `/devolucao-tarefas` da API do Render (utilizando as variáveis de segredo `RENDER_API_REALOCACAO_URL` e `RENDER_API_DEVOLUCAO_URL`).
 
 ### ⚖️ Licença
 
