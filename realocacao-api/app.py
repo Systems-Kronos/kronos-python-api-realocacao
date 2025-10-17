@@ -17,13 +17,7 @@ hoje = datetime.now().date()
 # --- Métodos ---
 def get_db_connection():
     try:
-        connection = psycopg2.connect(
-            host=os.getenv('SQL_HOST'),
-            user=os.getenv('SQL_USER'),
-            password=os.getenv('SQL_PASSWORD'),
-            dbname=os.getenv('SQL_DBNAME'),
-            port=os.getenv('SQL_PORT', 5432)
-        )
+        connection = psycopg2.connect(os.getenv('DATABASE_URL'))
         return connection
     except Exception as e:
         print(f"Erro ao conectar ao banco de dados: {e}")
@@ -80,7 +74,7 @@ def processar_realocacao(usuario_ausente_id):
                     "dDataExecucao": datetime.now().isoformat()
                 })
 
-        # Registra notificações para os usuários, tanto substitutos quanto o usuário ausente
+        # Registra notificações para os usuários
         for realocacao in tarefas_realocadas:
             if realocacao.get("cRealocacao"):
                 mensagem = f"Tarefa {realocacao['nCdTarefa']} realocada para você temporariamente."
@@ -117,6 +111,7 @@ def processar_devolucao(usuario_id):
                  , nCdUsuarioAtuante
               FROM TarefaUsuario
              WHERE nCdUsuarioOriginal = %s
+               AND nCdUsuarioOriginal != nCdUsuarioAtuante
         """, (usuario_id,))
         
         tarefas_a_devolver = cursor.fetchall()
@@ -128,34 +123,37 @@ def processar_devolucao(usuario_id):
             UPDATE TarefaUsuario
                SET nCdUsuarioAtuante = nCdUsuarioOriginal
              WHERE nCdUsuarioOriginal = %s
+               AND nCdUsuarioOriginal != nCdUsuarioAtuante
         """, (usuario_id,))
 
-        tarefas_realocadas = []
+        tarefas_devolvidas = []
         for tarefa in tarefas_a_devolver:
             tarefa_id = int(tarefa['nCdTarefa'])
-            usuario_atuante_id = int(tarefa['nddusuarioatuante'])
-            usuario_original_id = int(tarefa['ncdusuariooriginal'])                    
+            
+            usuario_atuante_anterior_id = int(tarefa['ncdusuarioatuante']) 
+            usuario_original_id = int(tarefa['ncdusuariooriginal'])                     
 
-            tarefas_realocadas.append({
+            tarefas_devolvidas.append({
                 "nCdTarefa": tarefa_id,
-                "nCdUsuarioAtuante": usuario_atuante_id,
+                "nCdUsuarioAtuanteAnterior": usuario_atuante_anterior_id,
                 "nCdUsuarioOriginal": usuario_original_id,
                 "nCdUsuarioRetornando": usuario_id,
-                "cRealocacao": True,
+                "cDevolucao": True,
                 "dDataExecucao": datetime.now().isoformat()
             })
         
-        for realocacao in tarefas_realocadas:
-            mensagem = f"Tarefa {realocacao['nCdTarefa']} foi devolvida para você!."
-            registra_notificacao(realocacao['nCdUsuarioRetornando'], mensagem)
+        # Notifica o usuário que está retornando
+        for devolucao in tarefas_devolvidas:
+            mensagem = f"Tarefa {devolucao['nCdTarefa']} foi devolvida para você!."
+            registra_notificacao(devolucao['nCdUsuarioRetornando'], mensagem)
 
         conn.commit() 
-        return True, tarefas_realocadas
+        return True, tarefas_devolvidas
 
     except Exception as e:
         if conn:
             conn.rollback() 
-        print(f"Erro inesperado durante a realocação SQL: {e}")
+        print(f"Erro inesperado durante a devolução SQL: {e}")
         return False, {"erro_sql": str(e)}
     finally:
         if conn:
@@ -168,7 +166,8 @@ def registra_notificacao(usuario_id, mensagem):
             port=int(os.getenv('REDIS_PORT')),
             db=int(os.getenv('REDIS_DB', 0)),
             username=os.getenv('REDIS_USER'),
-            password=os.getenv('REDIS_PASSWORD')
+            password=os.getenv('REDIS_PASSWORD'),
+            decode_responses=True 
         )
         notificacao_id = r.incr(f"usuario:{usuario_id}:notificacao:id")
         notificacao_key = f"usuario:{usuario_id}:notificacao:{notificacao_id}"
@@ -176,11 +175,10 @@ def registra_notificacao(usuario_id, mensagem):
         # Atributos da notificação
         agora = datetime.now().isoformat()
         
-        # Insere a notificação como um hash
         r.hset(notificacao_key, mapping={
             "nCdUsuario": usuario_id,
-            "cMensagem": json.dumps(mensagem),
-            "dCriacao": json.dumps(agora)   # vira "Gestor aceitou sua falta!"
+            "cMensagem": mensagem,
+            "dCriacao": agora
         })
 
         r.expire(notificacao_key, 7 * 24 * 3600)  # Expira em 7 dias
@@ -255,12 +253,13 @@ def processar_ausencias_agendadas():
         relatorio_geral = []
 
         for user_id in usuarios_a_processar:
-            print(f"  > Processando realocação agendada para o usuário {user_id}")
+            print(f"   > Processando realocação agendada para o usuário {user_id}")
             sucesso, realocacoes = processar_realocacao(user_id)
             
             if sucesso and realocacoes:
-                relatorios_collection.insert_many(realocacoes)
-                relatorio_geral.extend(realocacoes)
+                if isinstance(realocacoes, list): 
+                    relatorios_collection.insert_many(realocacoes)
+                    relatorio_geral.extend(realocacoes)
         
         print(f"Agendado: Processamento de {len(usuarios_a_processar)} usuários concluído.")
         
@@ -284,7 +283,8 @@ def devolucao_tarefa():
         calendario_collection = mongo_db.get_collection('calendario')
         relatorios_collection = mongo_db.get_collection('relatorios_realocacao')
 
-        # Busca no MongoDB por pessoas presentes que não registraram falta hoje, mas possuem uma falta no dia anterior.
+        # Busca no MongoDB por pessoas que estavam ausentes ontem (bPresenca: False)
+        # E NÃO registraram ausência para hoje (faltasHoje: tamanho 0)
         recem_presentes = calendario_collection.aggregate([
             { "$match": {
                 "bPresenca": False,
@@ -328,12 +328,19 @@ def devolucao_tarefa():
 
         relatorio_geral = []
         for user_id in usuarios_a_processar:
-            print(f"  > Processando devolução para o usuário {user_id}")
-            sucesso, realocacoes = processar_devolucao(user_id)
+            print(f"   > Processando devolução para o usuário {user_id}")
+            sucesso, devolucoes = processar_devolucao(user_id)
             
-            if sucesso and realocacoes:
-                relatorios_collection.insert_many(realocacoes)
-                relatorio_geral.extend(realocacoes)
+            if sucesso and devolucoes:
+                if isinstance(devolucoes, list):
+                    relatorios_collection.insert_many(devolucoes)
+                    relatorio_geral.extend(devolucoes)
+        
+        return jsonify({
+            "mensagem": "Processamento de devolução concluído com sucesso.",
+            "usuarios_processados": len(usuarios_a_processar),
+            "total_tarefas_devolvidas": len(relatorio_geral)
+        }), 200
 
     except Exception as e:
         print(f"Erro no processamento de devolução: {e}")
