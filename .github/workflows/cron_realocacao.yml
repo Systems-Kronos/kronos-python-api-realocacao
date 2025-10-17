@@ -2,7 +2,7 @@ name: Processamento Diário de Ausências
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,6 +14,15 @@ jobs:
           echo "Chamando a API do Render para processar ausências agendadas..."
           curl -X POST \
           -H "Content-Type: application/json" \
-          ${{ secrets.RENDER_API_URL }}
+          ${{ secrets.RENDER_API_REALOCACAO_URL }}
         env:
-          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+          RENDER_API_REALOCACAO_URL: ${{ secrets.RENDER_API_REALOCACAO_URL }}
+
+      - name: Executar Devolução de tarefas (Render API)
+        run: |
+          echo "Chamando a API do Render para processar devoluções de tarefas..."
+          curl -X POST \
+          -H "Content-Type: application/json" \
+          ${{ secrets.RENDER_API_DEVOLUCAO_URL }}
+        env:
+          RENDER_API_DEVOLUCAO_URL: ${{ secrets.RENDER_API_DEVOLUCAO_URL }}
