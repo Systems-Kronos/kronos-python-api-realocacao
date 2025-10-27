@@ -21,11 +21,6 @@ app = FastAPI(
 )
 hoje = datetime.now().date()
 
-# --- Pydantic Models ---
-# Modelo para a requisição de realocação imediata
-class RealocacaoRequest(BaseModel):
-    nCdUsuario: int
-
 # --- Handlers de Serialização ---
 
 def json_default_handler(obj):
@@ -226,12 +221,12 @@ def registra_notificacao(usuario_id, mensagem):
 
 @app.post('/realocar-tarefas', tags=["Realocação"], status_code=200,
           summary="Realoca tarefas de um usuário ausente (chamada pelo backend mobile).")
-async def realocar_tarefas(data: RealocacaoRequest):
+async def realocar_tarefas(nCdUsuario):
     """
     Realiza a realocação imediata de todas as tarefas de um usuário ausente 
     para um substituto qualificado (ou marca como não realocada).
     """
-    usuario_ausente_id = data.nCdUsuario
+    usuario_ausente_id = nCdUsuario
     
     print(f"Tempo Real: Iniciando realocação para o usuário {usuario_ausente_id}")
 
