@@ -2,22 +2,57 @@ import os
 import psycopg2
 import psycopg2.extras
 from pymongo import MongoClient
-from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
 from redis import Redis
 import json
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from bson import ObjectId
 
 load_dotenv("kronos-rpa/.env") 
 
 # --- Configurações iniciais ---
-app = Flask(__name__)
+app = FastAPI(
+    title="Kronos Realocação API",
+    description="Serviço para gerenciamento de realocação e devolução de tarefas.",
+    version="1.0.0"
+)
 hoje = datetime.now().date()
 
-# --- Métodos ---
+# --- Pydantic Models ---
+# Modelo para a requisição de realocação imediata
+class RealocacaoRequest(BaseModel):
+    nCdUsuario: int
+
+# --- Handlers de Serialização ---
+
+def json_default_handler(obj):
+    """Lida com tipos não serializáveis, como ObjectId do MongoDB."""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    # Garante que a data/hora também é serializável (FastAPI/Starlette já faz isso, mas é bom ter)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
+# --- Métodos de Conexão e Lógica de Negócio ---
+
 def get_db_connection():
     try:
-        connection = psycopg2.connect(os.getenv('DATABASE_URL'))
+        db_url = os.getenv('DATABASE_URL')
+        if db_url:
+            connection = psycopg2.connect(db_url)
+        else:
+            connection = psycopg2.connect(
+                host=os.getenv('SQL_HOST'),
+                user=os.getenv('SQL_USER'),
+                password=os.getenv('SQL_PASSWORD'),
+                dbname=os.getenv('SQL_DBNAME'),
+                port=os.getenv('SQL_PORT', 5432)
+            )
         return connection
     except Exception as e:
         print(f"Erro ao conectar ao banco de dados: {e}")
@@ -65,6 +100,9 @@ def processar_realocacao(usuario_ausente_id):
                     "cRealocacao": True,
                     "dDataExecucao": datetime.now().isoformat()
                 })
+                # Registra notificação para o substituto
+                mensagem = f"Tarefa {tarefa_id} realocada para você temporariamente."
+                registra_notificacao(substituto_id, mensagem)
             else:
                 tarefas_realocadas.append({
                     "nCdTarefa": tarefa_id,
@@ -73,15 +111,10 @@ def processar_realocacao(usuario_ausente_id):
                     "cRealocacao": False,
                     "dDataExecucao": datetime.now().isoformat()
                 })
-
-        # Registra notificações para os usuários
-        for realocacao in tarefas_realocadas:
-            if realocacao.get("cRealocacao"):
-                mensagem = f"Tarefa {realocacao['nCdTarefa']} realocada para você temporariamente."
-                registra_notificacao(realocacao['nCdUsuarioSubstituto'], mensagem)
-            else:
-                mensagem = f"Tarefa {realocacao['nCdTarefa']} não pôde ser realocada: {realocacao.get('cMotivo', 'Motivo desconhecido')}."
+                # Registra notificação para o usuário ausente sobre a falha na realocação
+                mensagem = f"Tarefa {tarefa_id} não pôde ser realocada: Nenhum substituto qualificado encontrado."
                 registra_notificacao(usuario_ausente_id, mensagem)
+
 
         conn.commit() 
         return True, tarefas_realocadas
@@ -164,11 +197,13 @@ def registra_notificacao(usuario_id, mensagem):
         r = Redis(
             host=os.getenv('REDIS_HOST', 'localhost'),
             port=int(os.getenv('REDIS_PORT')),
-            db=int(os.getenv('REDIS_DB', 0)),
             username=os.getenv('REDIS_USER'),
             password=os.getenv('REDIS_PASSWORD'),
             decode_responses=True 
         )
+        # Ping para garantir a conexão antes de usar
+        r.ping() 
+
         notificacao_id = r.incr(f"usuario:{usuario_id}:notificacao:id")
         notificacao_key = f"usuario:{usuario_id}:notificacao:{notificacao_id}"
 
@@ -187,46 +222,56 @@ def registra_notificacao(usuario_id, mensagem):
     except Exception as e:
         print(f"Erro ao registrar notificação no Redis: {e}")
       
-# --- Endpoints da API ---
+# --- Endpoints da API (FastAPI) ---
 
-@app.route('/realocar-tarefas', methods=['POST'])
-def realocar_tarefas():
+@app.post('/realocar-tarefas', tags=["Realocação"], status_code=200,
+          summary="Realoca tarefas de um usuário ausente (chamada pelo backend mobile).")
+async def realocar_tarefas(data: RealocacaoRequest):
+    """
+    Realiza a realocação imediata de todas as tarefas de um usuário ausente 
+    para um substituto qualificado (ou marca como não realocada).
+    """
+    usuario_ausente_id = data.nCdUsuario
+    
+    print(f"Tempo Real: Iniciando realocação para o usuário {usuario_ausente_id}")
+
+    sucesso, realocacoes = processar_realocacao(usuario_ausente_id)
+    
+    if not sucesso:
+        # Lança uma exceção HTTP 500 se houver falha na conexão ou execução SQL
+        raise HTTPException(status_code=500, detail={"erro": "Falha na realocação SQL.", "detalhes": realocacoes})
+    
     try:
-        data = request.get_json()
-        usuario_ausente_id = data.get('nCdUsuario')
+        # Salva o relatório no MongoDB
+        mongo_client = MongoClient(os.getenv('MONGODB_URI'))
+        mongo_db = mongo_client.get_database('dbKronos')
+        relatorios_collection = mongo_db.get_collection('relatorios_realocacao')
         
-        if not usuario_ausente_id:
-            return jsonify({"erro": "ID do usuário ausente na requisição"}), 400
-
-        print(f"Tempo Real: Iniciando realocação para o usuário {usuario_ausente_id}")
-
-        sucesso, realocacoes = processar_realocacao(usuario_ausente_id)
-        
-        if not sucesso:
-            return jsonify({"erro": "Falha na realocação SQL.", "detalhes": realocacoes}), 500
-        
-        try:
-            mongo_client = MongoClient(os.getenv('MONGODB_URI'))
-            mongo_db = mongo_client.get_database('dbKronos')
-            relatorios_collection = mongo_db.get_collection('relatorios_realocacao')
-            
-            if realocacoes: 
+        if realocacoes:
+            # Garante que o insert só ocorre se for uma lista válida de relocações
+            if isinstance(realocacoes, list): 
                 relatorios_collection.insert_many(realocacoes)
-            print("Relatório de realocação salvo no MongoDB.")
-        except Exception as e:
-            print(f"Erro ao salvar relatório no MongoDB: {e}")
-
-        return jsonify({
-            "mensagem": "Realocação de tarefas concluída com sucesso.",
-            "detalhes": realocacoes
-        }), 200
-
+        print("Relatório de realocação salvo no MongoDB.")
     except Exception as e:
-        print(f"Erro inesperado no endpoint /realocar-tarefas: {e}")
-        return jsonify({"erro": "Ocorreu um erro interno no servidor."}), 500
+        print(f"Erro ao salvar relatório no MongoDB: {e}")
+    
+    try:
+        json_serializable_realocacoes = json.loads(json.dumps(realocacoes, default=json_default_handler))
+    except Exception as e:
+        # Fallback de segurança caso a serialização falhe
+        print(f"Erro fatal na serialização de retorno: {e}")
+        json_serializable_realocacoes = [{"erro_serializacao": str(e), "mensagem": "Falha ao preparar relatórios para JSON"}]
 
-@app.route('/processar-ausencias-agendadas', methods=['POST'])
-def processar_ausencias_agendadas():
+    return JSONResponse(content={
+        "mensagem": "Realocação de tarefas concluída com sucesso.",
+        "detalhes": json_serializable_realocacoes
+    }, status_code=200)
+
+@app.post('/processar-ausencias-agendadas', tags=["Agendamento"], status_code=200,
+          summary="Processa todas as ausências agendadas para hoje (chamada CRON/Git Action).")
+async def processar_ausencias_agendadas():
+    # Busca no MongoDB por usuários com ausência agendada para o dia atual e 
+    # aciona a lógica de realocação para cada um.
     try:
         print(f"Agendado: Iniciando varredura de faltas para a data: {hoje}")
 
@@ -248,7 +293,7 @@ def processar_ausencias_agendadas():
         })
 
         usuarios_ausentes = [int(doc['nCdUsuario']) for doc in ausencias_hoje if 'nCdUsuario' in doc]
-        usuarios_a_processar = list(set(usuarios_ausentes)) # Processa cada usuário ausente apenas uma vez
+        usuarios_a_processar = list(set(usuarios_ausentes))
         
         relatorio_geral = []
 
@@ -263,18 +308,24 @@ def processar_ausencias_agendadas():
         
         print(f"Agendado: Processamento de {len(usuarios_a_processar)} usuários concluído.")
         
+        json_serializable_relatorio = json.loads(json.dumps(relatorio_geral, default=json_default_handler))
         
-        return jsonify({
+        return JSONResponse(content={
             "mensagem": "Processamento agendado concluído com sucesso.",
             "usuarios_processados": len(usuarios_a_processar),
-            "total_tarefas_realocadas": len(relatorio_geral)
-        }), 200
+            "total_tarefas_realocadas": len(json_serializable_relatorio)
+        }, status_code=200)
+
     except Exception as e:
         print(f"Erro no processamento agendado: {e}")
-        return jsonify({"erro": f"Erro no processamento agendado: {e}"}), 500
+        raise HTTPException(status_code=500, detail={"erro": f"Erro no processamento agendado: {e}"})
 
-@app.route('/devolucao-tarefas', methods=['POST'])
-def devolucao_tarefa():
+@app.post('/devolucao-tarefas', tags=["Agendamento"], status_code=200,
+          summary="Devolve tarefas a usuários que retornaram de falta (chamada CRON/Git Action).")
+async def devolucao_tarefa():
+    # Identifica usuários que estavam ausentes no dia anterior e que não agendaram falta 
+    # para o dia atual, devolvendo suas tarefas originais.
+
     try:
         print(f"Agendado: Iniciando varredura de presenças para a data: {hoje}")
 
@@ -283,8 +334,7 @@ def devolucao_tarefa():
         calendario_collection = mongo_db.get_collection('calendario')
         relatorios_collection = mongo_db.get_collection('relatorios_realocacao')
 
-        # Busca no MongoDB por pessoas que estavam ausentes ontem (bPresenca: False)
-        # E NÃO registraram ausência para hoje (faltasHoje: tamanho 0)
+        # Busca no MongoDB por recém-presentes
         recem_presentes = calendario_collection.aggregate([
             { "$match": {
                 "bPresenca": False,
@@ -336,15 +386,19 @@ def devolucao_tarefa():
                     relatorios_collection.insert_many(devolucoes)
                     relatorio_geral.extend(devolucoes)
         
-        return jsonify({
+        json_serializable_relatorio = json.loads(json.dumps(relatorio_geral, default=json_default_handler))
+        
+        return JSONResponse(content={
             "mensagem": "Processamento de devolução concluído com sucesso.",
             "usuarios_processados": len(usuarios_a_processar),
-            "total_tarefas_devolvidas": len(relatorio_geral)
-        }), 200
+            "total_tarefas_devolvidas": len(json_serializable_relatorio)
+        }, status_code=200)
 
     except Exception as e:
         print(f"Erro no processamento de devolução: {e}")
-        return jsonify({"erro": f"Erro no processamento de devolução: {e}"}), 500
+        raise HTTPException(status_code=500, detail={"erro": f"Erro no processamento de devolução: {e}"})
 
+# Configuração para rodar localmente com uvicorn
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
